@@ -191,37 +191,61 @@ class Ceil(BuiltinFunctionT):
 class Convert(BuiltinFunctionT):
     _id = "convert"
 
+    def _try_fold(self, node):
+        validate_call_args(node, 2)
+        value = node.args[0].get_folded_value()
+        target_type = node.args[1].get_folded_value()
+        if not isinstance(target_type, vy_ast.Name):
+            raise UnfoldableNode
+
+        # Get the target type
+        target_typedef = type_from_annotation(target_type)
+        if not isinstance(target_typedef, (BoolT, AddressT, IntegerT, BytesM_T)):
+            raise UnfoldableNode
+
+        # Convert the value based on target type
+        if isinstance(target_typedef, BoolT):
+            if isinstance(value, vy_ast.Int):
+                result = bool(value.value)
+            elif isinstance(value, vy_ast.Bool):
+                result = value.value
+            else:
+                raise UnfoldableNode
+            return vy_ast.Bool.from_node(node, value=result)
+
+        elif isinstance(target_typedef, AddressT):
+            if isinstance(value, vy_ast.Hex):
+                result = value.value
+            else:
+                raise UnfoldableNode
+            return vy_ast.Hex.from_node(node, value=result)
+
+        elif isinstance(target_typedef, IntegerT):
+            if isinstance(value, (vy_ast.Int, vy_ast.Decimal)):
+                result = int(value.value)
+            else:
+                raise UnfoldableNode
+            return vy_ast.Int.from_node(node, value=result)
+
+        elif isinstance(target_typedef, BytesM_T):
+            if isinstance(value, vy_ast.Hex):
+                result = value.value
+            else:
+                raise UnfoldableNode
+            return vy_ast.Hex.from_node(node, value=result)
+
+        raise UnfoldableNode
+
     def fetch_call_return(self, node):
         _, target_typedef = self.infer_arg_types(node)
 
         # note: more type conversion validation happens in convert.py
         return target_typedef.typedef
 
-    # TODO: push this down into convert.py for more consistency
     def infer_arg_types(self, node, expected_return_typ=None):
-        validate_call_args(node, 2)
-
+        self._validate_arg_types(node)
+        value_type = get_possible_types_from_node(node.args[0]).pop()
         target_type = type_from_annotation(node.args[1])
-        value_types = get_possible_types_from_node(node.args[0])
-
-        # For `convert` of integer literals, we need to match type inference rules in
-        # convert.py codegen routines.
-        # TODO: This can probably be removed once constant folding for `convert` is implemented
-        if len(value_types) > 1 and all(isinstance(v, IntegerT) for v in value_types):
-            # Get the smallest (and unsigned if available) type for non-integer target types
-            # (note this is different from the ordering returned by `get_possible_types_from_node`)
-            if not isinstance(target_type, IntegerT):
-                value_types = sorted(value_types, key=lambda v: (v.is_signed, v.bits), reverse=True)
-            else:
-                # filter out the target type from list of possible types
-                value_types = [i for i in value_types if not target_type.compare_type(i)]
-
-        value_type = value_types.pop()
-
-        # block conversions between same type
-        if target_type.compare_type(value_type):
-            raise InvalidType(f"Value and target type are both '{target_type}'", node)
-
         return [value_type, TYPE_T(target_type)]
 
     def build_IR(self, expr, context):
@@ -289,6 +313,39 @@ class Slice(BuiltinFunctionT):
         ("start", UINT256_T),
         ("length", UINT256_T),
     ]
+
+    def _try_fold(self, node):
+        validate_call_args(node, 3)
+        value = node.args[0].get_folded_value()
+        start = node.args[1].get_folded_value()
+        length = node.args[2].get_folded_value()
+
+        if not isinstance(start, vy_ast.Int) or not isinstance(length, vy_ast.Int):
+            raise UnfoldableNode
+
+        start_val = start.value
+        length_val = length.value
+
+        if length_val < 1:
+            raise ArgumentException("Length cannot be less than 1", node.args[2])
+
+        if isinstance(value, vy_ast.Bytes):
+            if start_val + length_val > len(value.value):
+                raise ArgumentException("slice out of bounds", node)
+            result = value.value[start_val:start_val + length_val]
+            return vy_ast.Bytes.from_node(node, value=result)
+        elif isinstance(value, vy_ast.Str):
+            if start_val + length_val > len(value.value):
+                raise ArgumentException("slice out of bounds", node)
+            result = value.value[start_val:start_val + length_val]
+            return vy_ast.Str.from_node(node, value=result)
+        elif isinstance(value, vy_ast.Hex):
+            if start_val + length_val > len(value.bytes_value):
+                raise ArgumentException("slice out of bounds", node)
+            result = value.bytes_value[start_val:start_val + length_val]
+            return vy_ast.Bytes.from_node(node, value=result)
+        else:
+            raise UnfoldableNode
 
     def fetch_call_return(self, node):
         arg_type, _, _ = self.infer_arg_types(node)
@@ -832,6 +889,29 @@ class Extract32(BuiltinFunctionT):
     _id = "extract32"
     _inputs = [("b", BytesT.any()), ("start", IntegerT.unsigneds())]
     _kwargs = {"output_type": KwargSettings(TYPE_T.any(), BYTES32_T)}
+
+    def _try_fold(self, node):
+        validate_call_args(node, 2)
+        value = node.args[0].get_folded_value()
+        start = node.args[1].get_folded_value()
+
+        if not isinstance(start, vy_ast.Int):
+            raise UnfoldableNode
+
+        start_val = start.value
+
+        if isinstance(value, vy_ast.Bytes):
+            if start_val + 32 > len(value.value):
+                raise ArgumentException("extract32 out of bounds", node)
+            result = value.value[start_val:start_val + 32]
+            return vy_ast.Bytes.from_node(node, value=result)
+        elif isinstance(value, vy_ast.Hex):
+            if start_val + 32 > len(value.bytes_value):
+                raise ArgumentException("extract32 out of bounds", node)
+            result = value.bytes_value[start_val:start_val + 32]
+            return vy_ast.Bytes.from_node(node, value=result)
+        else:
+            raise UnfoldableNode
 
     def fetch_call_return(self, node):
         self._validate_arg_types(node)
